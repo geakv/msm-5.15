@@ -1,0 +1,512 @@
+name: "build kernel"
+
+env:
+  OUT_DIR: "out"
+  KERNEL_VERSION: "5.15"
+  ANDROID_VERSION: "13"
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernelSourceURL:
+        description: "kernel source url"
+        required: true
+        default: "https://github.com/geakv/msm-5.15"
+      kernelBranch:
+        description: "branch"
+        required: true
+      kernelDevice:
+        description: "device (defconfig)"
+        required: true
+      localVersion:
+        description: "localversion (ex: -mybuild)"
+        required: false
+      buildKSU:
+        description: "ksu variant"
+        required: true
+        type: choice
+        options: [ "both", "ksu", "noksu" ]
+        default: "ksu"
+      ksuOptions:
+        description: "ksu type"
+        required: true
+        type: choice
+        options: [ "kowsu", "wildksu" ]
+        default: "kowsu"
+      tickRate:
+        description: "tick rate (Hz)"
+        default: "100Hz"
+        type: choice
+        options: [ "default", "100Hz", "250Hz", "300Hz" ]
+      optimizationLevel:
+        description: "optimization"
+        default: "O2"
+        type: choice
+        options: [ "default", "O2", "O3", "Os" ]
+      buildToolchains:
+        description: "toolchains"
+        default: "custom"
+        type: choice
+        options: [ "android", "custom" ]
+      LtoOptimizations:
+        description: "LTO type"
+        default: "thin"
+        type: choice
+        options: [ "thin", "full" ]
+
+jobs:
+  build-kernel:
+    name: "build kernel"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        variant: ${{ fromJSON(inputs.buildKSU == 'both' && '["noksu", "ksu"]' || inputs.buildKSU == 'ksu' && '["ksu"]' || '["noksu"]') }}
+ 
+    env:
+      kernelDir: common_${{ inputs.kernelDevice }}
+      kernelName: common
+      DEFCONFIG_NAME: ${{ inputs.kernelDevice }}_defconfig
+      WORK_DIR: ${{ github.workspace }}
+ 
+    steps:
+      - name: "initialize environment"
+        run: |
+          mkdir -p $kernelDir
+          sudo apt-get update -qq
+          sudo apt-get install -y repo rsync aria2 build-essential bc curl flex bison cpio rsync git zip dwarves libelf-dev libncurses-dev gcc-aarch64-linux-gnu libssl-dev python3 clang lld llvm llvm-dev
+          FIXED_DATE=$(TZ='Asia/Jakarta' date +'%Y-%m-%d')
+          echo "BUILD_TIME=$FIXED_DATE" >> $GITHUB_ENV
+          echo "KBUILD_BUILD_TIMESTAMP=$FIXED_DATE 00:00:00" >> $GITHUB_ENV
+
+      - name: "setup swap"
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 20
+
+      - name: "tune swap"
+        run: |
+          echo "vm.swappiness=80" | sudo tee -a /etc/sysctl.conf
+          sudo sysctl -p
+
+      - name: "clone source"
+        working-directory: ./${{ env.kernelDir }}
+        run: |
+          git clone --recursive --branch ${{ inputs.kernelBranch }} \
+          ${{ inputs.kernelSourceURL }} ${{ env.kernelName }} --depth=1
+
+      - name: "setup toolchain (AOSP)"
+        if: inputs.buildToolchains == 'android'
+        working-directory: ${{ env.WORK_DIR}}
+        run: |
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android13-5.15-lts --depth=1
+          repo sync --optimized-fetch --prune --no-clone-bundle --no-tags -j$(nproc --all)
+          
+          rm -rf .repo
+          rm -rf common
+
+          # get clang r596125
+          aria2c -x 16 -s 16 -o prebuilts/clang/host/linux-x86/clang-r596125.tar.gz https://github.com/bachnxuan/aosp_clang_mirror/releases/download/clang-r596125-15071444/clang-r596125.tar.gz
+    
+          mkdir -p prebuilts/clang/host/linux-x86/clang-r596125
+          tar -xzf prebuilts/clang/host/linux-x86/clang-r596125.tar.gz -C prebuilts/clang/host/linux-x86/clang-r596125
+          rm -rf prebuilts/clang/host/linux-x86/clang-r596125.tar.gz
+         
+          sed -i \
+          -e 's/^BRANCH=.*/BRANCH=android13-5.15/' \
+          -e 's/^CLANG_VERSION=.*/CLANG_VERSION=r596125/' \
+          ${{ env.kernelDir }}/${{ env.kernelName }}/build.config.constants
+    
+          sed -i '/^DEFCONFIG=gki_defconfig/d' ${{ env.kernelDir }}/${{ env.kernelName }}/build.config.gki
+          sed -i '$a\DEFCONFIG=${{ env.DEFCONFIG_NAME }}' ${{ env.kernelDir }}/${{ env.kernelName }}/build.config.gki
+          sed -i '/^POST_DEFCONFIG_CMDS="check_defconfig"/d' ${{ env.kernelDir }}/${{ env.kernelName }}/build.config.gki
+          
+          sed -i \
+            -e '/^KMI_SYMBOL_LIST_STRICT_MODE=/d' \
+            -e '/^TRIM_NONLISTED_KMI=/d' \
+            -e '/^KMI_ENFORCED=/d' \
+            -e '$a\KMI_SYMBOL_LIST_STRICT_MODE=0' \
+            -e '$a\TRIM_NONLISTED_KMI=0' \
+            -e '$a\KMI_ENFORCED=0' \
+            -e '/^MODULES_ORDER=/d' \
+            -e '/^MODULES_LIST=/d' \
+            ${{ env.kernelDir }}/${{ env.kernelName }}/build.config.gki.aarch64		  
+
+      - name: "setup toolchain (custom)"
+        if: inputs.buildToolchains == 'custom'
+        run: |
+          set -e  # exit on errors
+
+          # fetch latest release
+          get_latest_github_release() {
+          local repo_url="$1"
+          latest_url=$(curl -sL "https://api.github.com/repos/$repo_url/releases/latest" | grep "browser_download_url.*tar.gz" | cut -d '"' -f 4 | head -n 1)
+         
+          if [[ -z "$latest_url" ]]; then
+          echo "failed to fetch latest release from $repo_url!"
+          exit 1
+          fi
+  
+          printf "%s" "$latest_url"
+          }		  
+          
+          # printf
+          clang_url=$(get_latest_github_release "greenforce-project/greenforce_clang")
+          echo "clang URL: $clang_url"
+  
+          mkdir -p clang
+
+          # check if it's an archive or a repo
+          if [[ "$clang_url" == *.tar.gz ]]; then
+          wget --progress=bar:force -O "clang/clang.tar.gz" "$clang_url" || { echo "failed to download clang!"; exit 1; }
+  
+          # then extract
+          tar -xf clang/clang.tar.gz -C clang || { echo "extraction failed!"; exit 1; }
+          rm -f clang/clang.tar.gz
+          else
+          echo "cloning clang from $clang_url..."
+          git clone --recursive --depth=1 "$clang_url" clang || { echo "clone failed!"; exit 1; }
+          fi
+ 
+          # find clang bin
+          if [ -d "clang/bin" ]; then
+          CLANG_PATH="${{ github.workspace }}/clang/bin"
+          else
+          CLANG_PATH=$(find clang -type d -name "bin" | head -n 1)
+          CLANG_PATH="${{ github.workspace }}/${CLANG_PATH}"
+          fi
+  
+          # ensure
+          if [ ! -f "$CLANG_PATH/clang" ]; then
+          echo "clang binary not found in $CLANG_PATH! build might fail."
+          ls -R clang
+          exit 1
+          fi
+          
+          # show extracted clang
+          echo "using clang from $CLANG_PATH"
+          echo "CLANG_PATH=$CLANG_PATH" >> $GITHUB_ENV
+          echo "$CLANG_PATH" >> $GITHUB_PATH
+          
+          # ensure the path is updated
+          export PATH="$CLANG_PATH:$PATH"
+  
+          echo "clang version:"
+          clang --version || echo "clang not found in PATH!"
+          
+      - name: "configure args (custom)"
+        if: inputs.buildToolchains == 'custom'
+        id: generate-args
+        working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
+        run: |
+          args="-j$(nproc --all)"
+          if [ -n "${{ env.OUT_DIR }}" ]; then
+          mkdir -p $(pwd)/${{ env.OUT_DIR }}
+          args="$args O=$(pwd)/${{ env.OUT_DIR }}"
+          fi
+          args="$args ARCH=arm64 LLVM=1 LLVM_IAS=1 LTO=${{ inputs.LtoOptimizations }}"
+          args="$args CROSS_COMPILE=aarch64-linux-gnu-"
+          args="$args AR=llvm-ar"
+          args="$args CC=clang"
+          echo "args=$args" >> $GITHUB_OUTPUT
+
+      - name: "append custom Makefile line"
+        working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
+        run: |
+          echo 'KBUILD_CFLAGS += -Wno-default-const-init-unsafe' >> Makefile
+          echo 'KBUILD_CFLAGS += -Wno-uninitialized-const-pointer' >> Makefile
+          echo 'KBUILD_CFLAGS += -Wno-implicit-function-declaration' >> Makefile
+          echo 'KBUILD_CFLAGS += -Wno-sometimes-uninitialized' >> Makefile
+          echo 'KBUILD_CFLAGS += -mllvm -hot-cold-split=true' >> Makefile
+          echo "done"
+          
+      - name: "configure kernel & patching"
+        working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
+        run: |
+          CONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG_NAME }}"
+  
+          # remove existing LTO configuration
+          sed -i '/^CONFIG_LTO_CLANG_FULL/d' "$CONFIG_FILE"
+          
+          # basic configs
+          if [ -n "${{ inputs.localVersion }}" ]; then
+          echo "CONFIG_LOCALVERSION=\"${{ inputs.localVersion }}\"" >> "$CONFIG_FILE"
+          fi
+          echo -n "" > .scmversion
+          
+          # suppress GKI debugging
+          echo "CONFIG_SUPPRESS_VENDOR_MODULE_DEBUGGING=y" >> "$CONFIG_FILE"
+          
+          # LTO setup
+          if [ "${{ inputs.LtoOptimizations }}" = "thin" ]; then
+          sed -i '/CONFIG_LTO_CLANG_FULL/d' "$CONFIG_FILE"
+          echo "CONFIG_LTO_CLANG=y" >> "$CONFIG_FILE"
+          echo "# CONFIG_LTO_CLANG_FULL is not set" >> "$CONFIG_FILE"
+          echo "CONFIG_LTO_CLANG_THIN=y" >> "$CONFIG_FILE"
+          echo "CONFIG_THINLTO=y" >> "$CONFIG_FILE"
+          else
+          sed -i '/CONFIG_LTO_CLANG_FULL/d' "$CONFIG_FILE"
+          echo "CONFIG_LTO_CLANG=y" >> "$CONFIG_FILE"
+          echo "CONFIG_LTO_CLANG_FULL=y" >> "$CONFIG_FILE"
+          echo "# CONFIG_LTO_CLANG_THIN is not set" >> "$CONFIG_FILE"
+          echo "# CONFIG_THINLTO is not set" >> "$CONFIG_FILE"
+          fi
+
+          # apply optimization level
+          case "${{ inputs.optimizationLevel }}" in
+          default)
+          # nothing to add here
+          ;;
+          O2)
+          echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> "$CONFIG_FILE"
+          echo "# CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3 is not set" >> "$CONFIG_FILE"
+          echo "# CONFIG_CC_OPTIMIZE_FOR_SIZE is not set" >> "$CONFIG_FILE"
+          ;;
+          O3)
+          echo "# CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE is not set" >> "$CONFIG_FILE"
+          echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3=y" >> "$CONFIG_FILE"
+          echo "# CONFIG_CC_OPTIMIZE_FOR_SIZE is not set" >> "$CONFIG_FILE"
+          ;;
+          Os)
+          echo "# CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE is not set" >> "$CONFIG_FILE"
+          echo "# CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3 is not set" >> "$CONFIG_FILE"
+          echo "CONFIG_CC_OPTIMIZE_FOR_SIZE=y" >> "$CONFIG_FILE"
+          ;;
+          esac
+          
+          # tick rate
+          case "${{ inputs.tickRate }}" in
+          default)
+          # nothing to add here
+          ;;
+          100Hz)
+          sed -i '/^CONFIG_HZ_100=/d' "$CONFIG_FILE"
+          sed -i '/^CONFIG_HZ_250=/d' "$CONFIG_FILE"
+          sed -i '/^CONFIG_HZ_300=/d' "$CONFIG_FILE"
+          sed -i '/^CONFIG_HZ_1000=/d' "$CONFIG_FILE"
+          echo "CONFIG_NO_HZ_IDLE=y" >> "$CONFIG_FILE"
+          echo "CONFIG_HZ=100" >> "$CONFIG_FILE"
+          echo "CONFIG_HZ_100=y" >> "$CONFIG_FILE"
+          ;;
+          250Hz)
+          sed -i '/^CONFIG_HZ_100=/d' "$CONFIG_FILE"
+          sed -i '/^CONFIG_HZ_250=/d' "$CONFIG_FILE"
+          sed -i '/^CONFIG_HZ_300=/d' "$CONFIG_FILE"
+          sed -i '/^CONFIG_HZ_1000=/d' "$CONFIG_FILE"
+          echo "CONFIG_NO_HZ_IDLE=y" >> "$CONFIG_FILE"
+          echo "CONFIG_HZ=250" >> "$CONFIG_FILE"
+          echo "CONFIG_HZ_250=y" >> "$CONFIG_FILE"
+          ;;
+          300Hz)
+          sed -i '/^CONFIG_HZ_100=/d' "$CONFIG_FILE"
+          sed -i '/^CONFIG_HZ_250=/d' "$CONFIG_FILE"
+          sed -i '/^CONFIG_HZ_300=/d' "$CONFIG_FILE"
+          sed -i '/^CONFIG_HZ_1000=/d' "$CONFIG_FILE"
+          echo "CONFIG_NO_HZ_IDLE=y" >> "$CONFIG_FILE"
+          echo "CONFIG_HZ=300" >> "$CONFIG_FILE"
+          echo "CONFIG_HZ_300=y" >> "$CONFIG_FILE"
+          ;;
+          esac
+          
+          # sign build
+            aria2c -x 16 -s 16 -o sign.patch "https://raw.githubusercontent.com/geakv/patches/main/0001-scripts-sign-build.patch" 
+            patch -p1 < sign.patch || echo " patch failed, skipping..."
+
+      - name: "integrate wildksu"
+        if: matrix.variant == 'ksu' && inputs.ksuOptions == 'wildksu'
+        working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
+        run: | 
+          rm -rf ./KernelSU ./drivers/kernelsu
+
+          # install wildksu with susfs
+          curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/wild/kernel/setup.sh" | bash -s stable
+      
+          echo "✅ installed wildksu"
+          
+          # clone susfs4ksu kernel patches 
+          echo "cloning..."
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android13-5.15
+          SUSFS_KERNEL_PATCH="susfs4ksu/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch"
+          echo "applying..."
+          if patch -p1 < "$SUSFS_KERNEL_PATCH"; then
+          echo "✅ patched"
+          else
+          echo "⚠️ patch failed — copying files"
+          fi
+          
+          echo "applying SUSFS -> KernelSU patch..."
+          KSU_PATCH="susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+          
+          echo "forcing SUSFS source injection..."
+          
+          # replace fs/susfs.c
+          mkdir -p fs
+          cp -f susfs4ksu/kernel_patches/fs/susfs.c fs/susfs.c
+          echo "✅ copied fs/susfs.c"
+          
+          # replace include/linux/susfs.h
+          mkdir -p include/linux
+          cp -f susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/susfs.h
+          echo "✅ copied include/linux/susfs.h"
+          
+          # install missing susfs_def.h
+          if [ -f susfs4ksu/kernel_patches/include/linux/susfs_def.h ]; then
+          cp -f susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/susfs_def.h
+          echo "✅ copied include/linux/susfs_def.h"
+          else
+          echo "⚠️ susfs_def.h not found"
+          fi
+          
+          echo "🔍 verifying susfs files..."
+          for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
+          if [ -f "$f" ]; then echo "✔ found: $f"; else echo "❌ missing: $f"; fi
+          done
+          
+          # clean up susfs repo
+          rm -rf susfs4ksu
+          
+          # symlink drivers/kernelsu (if required)
+          if [ ! -L "drivers/kernelsu" ]; then
+          ln -sf ../KernelSU drivers/kernelsu
+          echo "✅ symlinked"
+          fi
+          
+          # add wildksu configs with susfs
+          CONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG_NAME }}"
+          cat >> "$CONFIG_FILE" << 'EOF'
+          CONFIG_KSU=y
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_SU=y
+          EOF
+          
+          echo "wildksu with susfs kernel patches fully integrated"
+
+      - name: "integrate kowsu"
+        if: matrix.variant == 'ksu' && inputs.ksuOptions == 'kowsu'
+        working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
+        run: |
+          rm -rf ./KernelSU ./drivers/kernelsu
+
+          # install kowsu
+          curl -LSs "https://raw.githubusercontent.com/KOWX712/KernelSU/main/kernel/setup.sh" | bash -s master
+                    
+          # add configs
+          CONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG_NAME }}"
+          cat >> "$CONFIG_FILE" << 'EOF'
+          CONFIG_KSU=y
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          EOF
+          
+          echo "✅ done"
+      
+      - name: "compile kernel (AOSP)"
+        if: inputs.buildToolchains == 'android'
+        working-directory: ${{ env.WORK_DIR }}
+        run: |
+          if [ "${{ inputs.LtoOptimizations }}" = "thin" ]; then
+          LTO=thin BUILD_CONFIG=${{ env.kernelDir }}/${{ env.kernelName }}/build.config.gki.aarch64 build/build.sh -j$(nproc --all)
+          else
+          LTO=full BUILD_CONFIG=${{ env.kernelDir }}/${{ env.kernelName }}/build.config.gki.aarch64 build/build.sh -j$(nproc --all)
+          fi
+          
+      - name: "create defconfig (custom)"
+        if: inputs.buildToolchains == 'custom'
+        working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
+        env:
+          args: ${{ steps.generate-args.outputs.args }}
+        run: |
+          make ${{ env.args }} ${{ env.DEFCONFIG_NAME }}
+   
+      - name: "compile kernel (custom)"
+        if: inputs.buildToolchains == 'custom'
+        working-directory: ./${{ env.kernelDir }}/${{ env.kernelName }}
+        env:
+          args: ${{ steps.generate-args.outputs.args }}
+        run: |
+          make ${args} \
+          LLVM=1 \
+          LLVM_IAS=1 \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          CC=clang \
+          LD=ld.lld \
+          AR=llvm-ar \
+          NM=llvm-nm \
+          OBJCOPY=llvm-objcopy \
+          OBJDUMP=llvm-objdump \
+          STRIP=llvm-strip \
+          -j$(nproc --all)
+
+      - name: prepare artifact
+        working-directory: ${{ env.WORK_DIR }}
+        run: |
+          mkdir -p out/dist
+
+          if [ "${{ inputs.buildToolchains }}" = "android" ]; then
+          src="out/dist/Image"
+          else
+          src="${{ env.kernelDir }}/${{ env.kernelName }}/out/arch/arm64/boot/Image"
+          fi
+
+          cp "${src}" "out/dist/Image.${{ matrix.variant }}"
+      
+      - name: "final disk cleanup"
+        run: |
+          rm -rf ${{ env.kernelDir }}
+          echo "✅ kernel source and build objects removed"
+      
+      - name: "upload artifact"
+        uses: actions/upload-artifact@v6
+        with:
+          name: kernel-${{ matrix.variant }}
+          path: ${{ env.WORK_DIR }}/out/dist/Image.${{ matrix.variant }}
+          retention-days: 3
+          
+  package-kernels:
+    name: "package kernels"
+    runs-on: ubuntu-latest
+    needs: build-kernel
+    steps:
+      - name: "download artifacts"
+        uses: actions/download-artifact@v8
+        with:
+          path: ./kernels/
+
+      - name: "create AnyKernel3"
+        run: |
+          BUILD_TIME=$(date +'%Y-%m-%d')
+          git clone --depth=1 https://github.com/geakv/AnyKernel3 -b master AnyKernel3
+          
+          # copy kernels
+          find kernels -name "Image.*" -exec cp {} AnyKernel3/ \;
+          
+          # create ZIP
+          ZIP_NAME="veen_${{ inputs.ksuOptions }}_${BUILD_TIME}.zip"
+          cd AnyKernel3
+          zip -r9 "../$ZIP_NAME" * -x .git/*
+          cd ..
+          echo "ZIP_PATH=$(pwd)/$ZIP_NAME" >> $GITHUB_ENV
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: "📤 upload final package"
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_PATH }}
+          retention-days: 1
